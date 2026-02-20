@@ -3,6 +3,8 @@ import * as http2 from "node:http2";
 import * as net from "node:net";
 import type { ProxyServerOptions } from "./types.js";
 import { escapeHtml, formatUrl } from "./utils.js";
+import { generateLoadingPage, PORTLESS_LOADING_HEADER } from "./loading-page.js";
+import { tryAutoStart } from "./auto-start.js";
 
 /** Response header used to identify a portless proxy (for health checks). */
 export const PORTLESS_HEADER = "X-Portless";
@@ -67,9 +69,73 @@ export type ProxyServer = http.Server | net.Server;
  * browsers while keeping WebSocket upgrades working over HTTP/1.1.
  */
 export function createProxyServer(options: ProxyServerOptions): ProxyServer {
-  const { getRoutes, proxyPort, onError = (msg: string) => console.error(msg), tls } = options;
+  const { getRoutes, proxyPort, onError = (msg: string) => console.error(msg), tls, autoStart } =
+    options;
 
   const isTls = !!tls;
+
+  /**
+   * Send the 404 "Not Found" page.
+   */
+  const send404 = (host: string, res: http.ServerResponse) => {
+    const routes = getRoutes();
+    const safeHost = escapeHtml(host);
+    res.writeHead(404, { "Content-Type": "text/html" });
+    res.end(`
+      <html>
+        <head><title>portless - Not Found</title></head>
+        <body style="font-family: system-ui; padding: 40px; max-width: 600px; margin: 0 auto;">
+          <h1>Not Found</h1>
+          <p>No app registered for <strong>${safeHost}</strong></p>
+          ${
+            routes.length > 0
+              ? `
+            <h2>Active apps:</h2>
+            <ul>
+              ${routes.map((r) => `<li><a href="${escapeHtml(formatUrl(r.hostname, proxyPort, isTls))}">${escapeHtml(r.hostname)}</a> - localhost:${escapeHtml(String(r.port))}</li>`).join("")}
+            </ul>
+          `
+              : "<p><em>No apps running.</em></p>"
+          }
+          <p>Start an app with: <code>portless ${safeHost.replace(".localhost", "")} your-command</code></p>
+        </body>
+      </html>
+    `);
+  };
+
+  /**
+   * Send the loading page while an app is starting.
+   */
+  const sendLoadingPage = (host: string, res: http.ServerResponse) => {
+    res.setHeader(PORTLESS_LOADING_HEADER, "1");
+    res.writeHead(202, { "Content-Type": "text/html" });
+    res.end(generateLoadingPage({ hostname: host, proxyPort, tls: isTls }));
+  };
+
+  /**
+   * Handle auto-start for an unknown host.
+   * Returns true if auto-start was triggered (loading page sent), false otherwise.
+   */
+  const handleAutoStart = async (host: string, res: http.ServerResponse): Promise<boolean> => {
+    if (!autoStart || !autoStart.config.enabled) {
+      return false;
+    }
+
+    // Check if already starting
+    if (autoStart.isAppStarting(host)) {
+      sendLoadingPage(host, res);
+      return true;
+    }
+
+    // Try to start the app
+    const port = await tryAutoStart(host, autoStart);
+    if (port !== null) {
+      sendLoadingPage(host, res);
+      return true;
+    }
+
+    return false;
+  };
 
   const handleRequest = (req: http.IncomingMessage, res: http.ServerResponse) => {
     res.setHeader(PORTLESS_HEADER, "1");
@@ -85,29 +151,23 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
 
     const route = routes.find((r) => r.hostname === host);
 
+    // Check if app is still starting - show loading page instead of proxying
+    if (autoStart?.isAppStarting(host)) {
+      sendLoadingPage(host, res);
+      return;
+    }
+
     if (!route) {
-      const safeHost = escapeHtml(host);
-      res.writeHead(404, { "Content-Type": "text/html" });
-      res.end(`
-        <html>
-          <head><title>portless - Not Found</title></head>
-          <body style="font-family: system-ui; padding: 40px; max-width: 600px; margin: 0 auto;">
-            <h1>Not Found</h1>
-            <p>No app registered for <strong>${safeHost}</strong></p>
-            ${
-              routes.length > 0
-                ? `
-              <h2>Active apps:</h2>
-              <ul>
-                ${routes.map((r) => `<li><a href="${escapeHtml(formatUrl(r.hostname, proxyPort, isTls))}">${escapeHtml(r.hostname)}</a> - localhost:${escapeHtml(String(r.port))}</li>`).join("")}
-              </ul>
-            `
-                : "<p><em>No apps running.</em></p>"
-            }
-            <p>Start an app with: <code>portless ${safeHost.replace(".localhost", "")} your-command</code></p>
-          </body>
-        </html>
-      `);
+      // Try auto-start if configured
+      handleAutoStart(host, res)
+        .then((handled) => {
+          if (!handled) {
+            send404(host, res);
+          }
+        })
+        .catch(() => {
+          send404(host, res);
+        });
       return;
     }
 

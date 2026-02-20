@@ -25,6 +25,9 @@ import {
   waitForProxy,
   writeTlsMarker,
 } from "./cli-utils.js";
+import { loadGlobalConfig, getAutoStartConfig } from "./config.js";
+import { createAutoStartContext, stopAllAutoStartedApps } from "./auto-start.js";
+import type { AutoStartContext } from "./types.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -49,7 +52,8 @@ const SUDO_SPAWN_TIMEOUT_MS = 30_000;
 function startProxyServer(
   store: RouteStore,
   proxyPort: number,
-  tlsOptions?: { cert: Buffer; key: Buffer }
+  tlsOptions?: { cert: Buffer; key: Buffer },
+  autoStartContext?: AutoStartContext
 ): void {
   store.ensureDir();
 
@@ -96,6 +100,7 @@ function startProxyServer(
     proxyPort,
     onError: (msg) => console.error(chalk.red(msg)),
     tls: tlsOptions,
+    autoStart: autoStartContext,
   });
 
   server.on("error", (err: NodeJS.ErrnoException) => {
@@ -136,6 +141,8 @@ function startProxyServer(
     if (watcher) {
       watcher.close();
     }
+    // Stop all auto-started apps
+    stopAllAutoStartedApps();
     try {
       fs.unlinkSync(store.pidPath);
     } catch {
@@ -717,7 +724,27 @@ ${chalk.bold("Usage: portless proxy <command>")}
     // Foreground mode: run the proxy directly in this process
     if (isForeground) {
       console.log(chalk.blue.bold("\nportless proxy\n"));
-      startProxyServer(store, proxyPort, tlsOptions);
+
+      // Load global config and create auto-start context
+      const globalConfig = loadGlobalConfig(stateDir);
+      const autoStartConfig = getAutoStartConfig(globalConfig);
+      let autoStartContext: AutoStartContext | undefined;
+      if (autoStartConfig.directories.length > 0) {
+        autoStartContext = createAutoStartContext(
+          stateDir,
+          autoStartConfig,
+          store,
+          proxyPort,
+          useHttps
+        );
+        console.log(
+          chalk.gray(
+            `Auto-start enabled for: ${autoStartConfig.directories.join(", ")}`
+          )
+        );
+      }
+
+      startProxyServer(store, proxyPort, tlsOptions, autoStartContext);
       return;
     }
 
